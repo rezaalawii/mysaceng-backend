@@ -68,7 +68,7 @@ app.post('/api/payment/token', async (req, res) => {
     });
 
     // Generate Order ID yang unik namun informatif
-    // Format: INV-SPP-NISN-INDEX-TIMESTAMP (misal: INV-SPP-0045928120-0-1716550200)
+    // Format: INV-SPP-NISN-INDEX-TIMESTAMP (misal: INV-SPP-102649281-4-1716550200)
     const orderId = `INV-${type.toUpperCase()}-${nisn}-${index}-${Date.now()}`;
 
     const parameter = {
@@ -85,7 +85,11 @@ app.post('/api/payment/token', async (req, res) => {
         price: parseInt(amount),
         quantity: 1,
         name: item
-      }]
+      }],
+      // SOLUSI REDIRECT: Mengatur callback URL secara manual agar tidak kembali ke example.com
+      callbacks: {
+        finish: "https://sppsmkcengkareng2.web.app"
+      }
     };
 
     const transaction = await snap.createTransaction(parameter);
@@ -130,10 +134,9 @@ app.post('/api/payment/notification', async (req, res) => {
 
     if (isPaymentSuccess) {
       // Parsing data dari Order ID (INV-TYPE-NISN-INDEX-TIMESTAMP)
-      // Contoh: ["INV", "SPP", "0045928120", "0", "1716550200"]
+      // Contoh: ["INV", "SPP", "102649281", "4", "1779644302638"]
       const parts = orderId.split('-');
       
-      // LOG DEBUGGING UNTUK VERCEL LOGS: Memudahkan pelacakan status inisialisasi Firebase Admin
       console.log(`[Status SDK] Memeriksa inisialisasi database: admin.apps.length = ${admin.apps.length}`);
 
       if (parts.length >= 4 && admin.apps.length > 0) {
@@ -142,9 +145,22 @@ app.post('/api/payment/notification', async (req, res) => {
         const itemIndex = parseInt(parts[3]);
 
         const db = admin.firestore();
-        // Path Strict: /artifacts/{appId}/public/data/students/{nisn}
-        const studentRef = db.doc(`artifacts/${appId}/public/data/students/${nisn}`);
-        const docSnap = await studentRef.get();
+        
+        // Melakukan penelusuran dokumen dengan 2 skenario path agar fleksibel (mencari berdasarkan NISN)
+        let studentRef = db.doc(`artifacts/${appId}/public/data/students/${nisn}`);
+        let docSnap = await studentRef.get();
+
+        // Skenario fallback jika dokumen di Firestore menggunakan ID dokumen acak (bukan NISN)
+        if (!docSnap.exists) {
+          console.log(`[Fallback Search] Mencari dokumen siswa dengan field nisn == ${nisn}`);
+          const studentsColl = db.collection(`artifacts/${appId}/public/data/students`);
+          const querySnapshot = await studentsColl.where('nisn', '==', nisn).get();
+          
+          if (!querySnapshot.empty) {
+            studentRef = querySnapshot.docs[0].ref;
+            docSnap = querySnapshot.docs[0];
+          }
+        }
 
         if (docSnap.exists) {
           const studentData = docSnap.data();
@@ -182,7 +198,7 @@ app.post('/api/payment/notification', async (req, res) => {
             });
           }
 
-          // Simpan perubahan ke Firestore
+          // Simpan perubahan ke Firestore secara aman
           await studentRef.update({
             sppMonths: updatedSpp,
             nonSppTagihan: updatedNonSpp,
@@ -206,7 +222,7 @@ app.post('/api/payment/notification', async (req, res) => {
           console.warn(`⚠ Siswa dengan NISN ${nisn} tidak ditemukan di database.`);
         }
       } else if (admin.apps.length === 0) {
-        console.error("✗ database TIDAK dapat diperbarui karena Firebase Admin SDK tidak aktif di Vercel.");
+        console.error("✗ Database tidak dapat diperbarui karena Firebase Admin SDK tidak aktif di Vercel.");
       }
     }
 
