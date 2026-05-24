@@ -9,16 +9,24 @@ const PORT = process.env.PORT || 3000;
 
 const appId = process.env.APP_ID || 'mysaceng';
 
-// 1. Menginisialisasi Firebase Admin SDK secara aman untuk mengupdate Firestore langsung dari backend
+// 1. Menginisialisasi Firebase Admin SDK secara aman dengan auto-sanitize format JSON dari Vercel
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   try {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    let rawServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+    
+    // Perbaikan Otomatis: Mengatasi string escape newline (\\n) yang sering rusak di Vercel env
+    if (rawServiceAccount.includes('\\n')) {
+      rawServiceAccount = rawServiceAccount.replace(/\\n/g, '\n');
+    }
+    
+    const serviceAccount = JSON.parse(rawServiceAccount);
+    
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
     });
-    console.log("✓ Firebase Admin SDK berhasil diinisialisasi.");
+    console.log("✓ Firebase Admin SDK berhasil diinisialisasi secara sempurna.");
   } catch (err) {
-    console.error("✗ Gagal menginisialisasi Firebase Admin SDK:", err);
+    console.error("✗ Gagal menginisialisasi Firebase Admin SDK karena error parsing JSON:", err.message);
   }
 } else {
   console.warn("⚠ FIREBASE_SERVICE_ACCOUNT tidak ditemukan di Environment Variables. Sistem berjalan tanpa auto-update Firestore.");
@@ -124,6 +132,10 @@ app.post('/api/payment/notification', async (req, res) => {
       // Parsing data dari Order ID (INV-TYPE-NISN-INDEX-TIMESTAMP)
       // Contoh: ["INV", "SPP", "0045928120", "0", "1716550200"]
       const parts = orderId.split('-');
+      
+      // LOG DEBUGGING UNTUK VERCEL LOGS: Memudahkan pelacakan status inisialisasi Firebase Admin
+      console.log(`[Status SDK] Memeriksa inisialisasi database: admin.apps.length = ${admin.apps.length}`);
+
       if (parts.length >= 4 && admin.apps.length > 0) {
         const type = parts[1].toLowerCase(); // "spp" atau "non" / "other"
         const nisn = parts[2];
@@ -193,6 +205,8 @@ app.post('/api/payment/notification', async (req, res) => {
         } else {
           console.warn(`⚠ Siswa dengan NISN ${nisn} tidak ditemukan di database.`);
         }
+      } else if (admin.apps.length === 0) {
+        console.error("✗ database TIDAK dapat diperbarui karena Firebase Admin SDK tidak aktif di Vercel.");
       }
     }
 
