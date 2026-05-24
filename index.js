@@ -168,8 +168,8 @@ app.post('/api/payment/notification', async (req, res) => {
           const dateStr = getFormattedCurrentDateTime();
           const cleanMethod = (paymentType || 'MIDTRANS').toUpperCase();
 
-          let updatedSpp = [...studentData.sppMonths];
-          let updatedNonSpp = [...studentData.nonSppTagihan];
+          let updatedSpp = studentData.sppMonths ? [...studentData.sppMonths] : [];
+          let updatedNonSpp = studentData.nonSppTagihan ? [...studentData.nonSppTagihan] : [];
           let updatedHistory = studentData.history ? [...studentData.history] : [];
           let itemTitle = "";
 
