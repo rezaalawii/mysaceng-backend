@@ -86,9 +86,9 @@ app.post('/api/payment/token', async (req, res) => {
         quantity: 1,
         name: item
       }],
-      // SOLUSI REDIRECT: Mengatur callback URL secara manual agar tidak kembali ke example.com
+      // SOLUSI REDIRECT: Mengatur callback URL secara manual dengan parameter sukses agar dideteksi frontend
       callbacks: {
-        finish: "https://sppsmkcengkareng2.web.app"
+        finish: "https://sppsmkcengkareng2.web.app/?payment_status=success"
       }
     };
 
@@ -146,19 +146,20 @@ app.post('/api/payment/notification', async (req, res) => {
 
         const db = admin.firestore();
         
-        // Melakukan penelusuran dokumen dengan 2 skenario path agar fleksibel (mencari berdasarkan NISN)
+        // Skenario 1: Cari dokumen siswa dengan ID dokumen = NISN langsung
         let studentRef = db.doc(`artifacts/${appId}/public/data/students/${nisn}`);
         let docSnap = await studentRef.get();
 
-        // Skenario fallback jika dokumen di Firestore menggunakan ID dokumen acak (bukan NISN)
+        // Skenario 2 (Paling Aman): Jika dokumen dengan nama ID NISN tidak ada, cari berdasarkan query field 'nisn'
         if (!docSnap.exists) {
-          console.log(`[Fallback Search] Mencari dokumen siswa dengan field nisn == ${nisn}`);
+          console.log(`[Fallback Search] Dokumen ID ${nisn} tidak ada. Mencari siswa berdasarkan field 'nisn' == ${nisn}...`);
           const studentsColl = db.collection(`artifacts/${appId}/public/data/students`);
           const querySnapshot = await studentsColl.where('nisn', '==', nisn).get();
           
           if (!querySnapshot.empty) {
             studentRef = querySnapshot.docs[0].ref;
             docSnap = querySnapshot.docs[0];
+            console.log(`[Fallback Found] Menemukan dokumen dengan ID acak: ${docSnap.id}`);
           }
         }
 
