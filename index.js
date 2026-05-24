@@ -9,30 +9,41 @@ const PORT = process.env.PORT || 3000;
 
 const appId = process.env.APP_ID || 'mysaceng';
 
-// 1. Menginisialisasi Firebase Admin SDK secara aman dengan auto-sanitize format JSON dari Vercel
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  try {
-    let rawServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
-    
-    // Perbaikan Otomatis: Mengatasi string escape newline (\\n) yang sering rusak di Vercel env
-    if (rawServiceAccount.includes('\\n')) {
-      rawServiceAccount = rawServiceAccount.replace(/\\n/g, '\n');
-    }
-    
-    const serviceAccount = JSON.parse(rawServiceAccount);
-    
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-    console.log("✓ Firebase Admin SDK berhasil diinisialisasi secara sempurna.");
-  } catch (err) {
-    console.error("✗ Gagal menginisialisasi Firebase Admin SDK karena error parsing JSON:", err.message);
+// Fungsi pembantu untuk menginisialisasi Firebase Admin SDK secara tangguh & aman
+function initFirebaseAdmin() {
+  if (admin.apps.length > 0) {
+    return admin.apps[0].firestore();
   }
-} else {
-  console.warn("⚠ FIREBASE_SERVICE_ACCOUNT tidak ditemukan di Environment Variables. Sistem berjalan tanpa auto-update Firestore.");
+
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    try {
+      let rawServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+      
+      // Mengatasi string escape newline (\\n) yang sering rusak di environment variable Vercel
+      if (rawServiceAccount.includes('\\n')) {
+        rawServiceAccount = rawServiceAccount.replace(/\\n/g, '\n');
+      }
+      
+      const serviceAccount = JSON.parse(rawServiceAccount);
+      
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+      });
+      console.log("✓ Firebase Admin SDK berhasil diinisialisasi secara sempurna.");
+      return admin.firestore();
+    } catch (err) {
+      console.error("✗ Gagal menginisialisasi Firebase Admin SDK karena error parsing JSON:", err.message);
+    }
+  } else {
+    console.warn("⚠ FIREBASE_SERVICE_ACCOUNT tidak ditemukan di Environment Variables.");
+  }
+  return null;
 }
 
-// 2. Mengaktifkan CORS agar diizinkan diakses oleh domain Firebase / Production Frontend Anda
+// Inisialisasi awal saat server dinyalakan
+initFirebaseAdmin();
+
+// Mengaktifkan CORS agar diizinkan diakses oleh domain Firebase / Production Frontend Anda
 app.use(cors({
   origin: ['https://sppsmkcengkareng2.web.app', 'http://localhost:5000', 'http://127.0.0.1:5000'],
   methods: ['GET', 'POST'],
@@ -46,7 +57,7 @@ app.get('/healthz', (req, res) => {
   res.status(200).send('OK');
 });
 
-// 3. Endpoint untuk Membuat Token Transaksi Midtrans
+// Endpoint untuk Membuat Token Transaksi Midtrans
 app.post('/api/payment/token', async (req, res) => {
   try {
     const { nisn, nama, item, amount, index, type } = req.body;
@@ -68,7 +79,7 @@ app.post('/api/payment/token', async (req, res) => {
     });
 
     // Generate Order ID yang unik namun informatif
-    // Format: INV-SPP-NISN-INDEX-TIMESTAMP (misal: INV-SPP-102649281-4-1716550200)
+    // Format: INV-SPP-NISN-INDEX-TIMESTAMP (misal: INV-SPP-102649281-0-1716550200)
     const orderId = `INV-${type.toUpperCase()}-${nisn}-${index}-${Date.now()}`;
 
     const parameter = {
@@ -101,7 +112,7 @@ app.post('/api/payment/token', async (req, res) => {
   }
 });
 
-// 4. Endpoint Webhook Baru untuk Menangkap Notifikasi HTTP Otomatis dari Midtrans
+// Endpoint Webhook Baru untuk Menangkap Notifikasi HTTP Otomatis dari Midtrans
 app.post('/api/payment/notification', async (req, res) => {
   try {
     const serverKey = process.env.MIDTRANS_SERVER_KEY;
@@ -134,32 +145,40 @@ app.post('/api/payment/notification', async (req, res) => {
 
     if (isPaymentSuccess) {
       // Parsing data dari Order ID (INV-TYPE-NISN-INDEX-TIMESTAMP)
-      // Contoh: ["INV", "SPP", "102649281", "4", "1779644302638"]
+      // Contoh: ["INV", "SPP", "102649281", "0", "1779644302638"]
       const parts = orderId.split('-');
       
-      console.log(`[Status SDK] Memeriksa inisialisasi database: admin.apps.length = ${admin.apps.length}`);
+      // Dapatkan atau inisialisasi instance Firestore secara realtime (tangguh untuk Serverless)
+      const db = initFirebaseAdmin();
 
-      if (parts.length >= 4 && admin.apps.length > 0) {
+      if (parts.length >= 4 && db) {
         const type = parts[1].toLowerCase(); // "spp" atau "non" / "other"
         const nisn = parts[2];
         const itemIndex = parseInt(parts[3]);
 
-        const db = admin.firestore();
-        
         // Skenario 1: Cari dokumen siswa dengan ID dokumen = NISN langsung
         let studentRef = db.doc(`artifacts/${appId}/public/data/students/${nisn}`);
         let docSnap = await studentRef.get();
 
-        // Skenario 2 (Paling Aman): Jika dokumen dengan nama ID NISN tidak ada, cari berdasarkan query field 'nisn'
+        // Skenario 2 (Tangguh): Jika ID dokumen bukan NISN langsung, lakukan query pencarian field 'nisn'
+        // Mendukung pencocokan format tipe data String maupun Number di Firestore
         if (!docSnap.exists) {
-          console.log(`[Fallback Search] Dokumen ID ${nisn} tidak ada. Mencari siswa berdasarkan field 'nisn' == ${nisn}...`);
+          console.log(`[Fallback Search 1] Dokumen ID ${nisn} tidak ditemukan. Mencari via field 'nisn' (String)...`);
           const studentsColl = db.collection(`artifacts/${appId}/public/data/students`);
-          const querySnapshot = await studentsColl.where('nisn', '==', nisn).get();
+          
+          // Uji pencarian NISN sebagai String
+          let querySnapshot = await studentsColl.where('nisn', '==', nisn).get();
+          
+          // Uji pencarian NISN sebagai Number jika pencarian String di atas nihil
+          if (querySnapshot.empty && !isNaN(nisn)) {
+            console.log(`[Fallback Search 2] Mencari via field 'nisn' (Number) == ${parseInt(nisn)}...`);
+            querySnapshot = await studentsColl.where('nisn', '==', parseInt(nisn)).get();
+          }
           
           if (!querySnapshot.empty) {
             studentRef = querySnapshot.docs[0].ref;
             docSnap = querySnapshot.docs[0];
-            console.log(`[Fallback Found] Menemukan dokumen dengan ID acak: ${docSnap.id}`);
+            console.log(`[Fallback Found] Menemukan dokumen siswa dengan ID dokumen: ${docSnap.id}`);
           }
         }
 
@@ -222,8 +241,8 @@ app.post('/api/payment/notification', async (req, res) => {
         } else {
           console.warn(`⚠ Siswa dengan NISN ${nisn} tidak ditemukan di database.`);
         }
-      } else if (admin.apps.length === 0) {
-        console.error("✗ Database tidak dapat diperbarui karena Firebase Admin SDK tidak aktif di Vercel.");
+      } else {
+        console.error("✗ Gagal memproses data karena inisialisasi database Firestore tidak aktif.");
       }
     }
 
