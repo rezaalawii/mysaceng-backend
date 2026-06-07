@@ -10,19 +10,24 @@ const PORT = process.env.PORT || 3000;
 const appId = process.env.APP_ID || 'mysaceng';
 const projectId = process.env.FIREBASE_PROJECT_ID || 'sppsmkcengkareng2';
 
-// Menggunakan URL Cloud Production asia-southeast2 secara default agar koneksi SQL Connect aktif dari Vercel
+// Menggunakan URL Cloud Production asia-southeast2 secara default
 const DATA_CONNECT_ENDPOINT = process.env.DATA_CONNECT_ENDPOINT || 
   `https://firebasedataconnect.googleapis.com/v1beta/projects/${projectId}/locations/asia-southeast2/services/${appId}-service:executeGraphQL`;
 
 app.use(cors({
-  origin: ['https://sppsmkcengkareng2.web.app', 'http://localhost:5000', 'http://127.0.0.1:5000'],
+  origin: [
+    'https://sppsmkcengkareng2.web.app', 
+    'https://sppsmkcengkareng2.firebaseapp.com', 
+    'http://localhost:5000', 
+    'http://127.0.0.1:5000'
+  ],
   methods: ['GET', 'POST'],
   credentials: true
 }));
 
 app.use(express.json());
 
-// Inisialisasi Firebase Admin untuk fallback NoSQL realtime sync
+// Inisialisasi Firebase Admin untuk fallback NoSQL realtime sync secara aman
 function initFirebaseAdmin() {
   if (admin.apps.length > 0) {
     return admin.apps[0].firestore();
@@ -51,7 +56,7 @@ function initFirebaseAdmin() {
 
 const db = initFirebaseAdmin();
 
-// Helper untuk eksekusi query/mutation ke Firebase Data Connect (Cloud SQL PostgreSQL)
+// Helper aman untuk eksekusi query/mutation ke Firebase Data Connect
 async function executeDataConnect(operationName, query, variables = {}) {
   try {
     const response = await axios.post(DATA_CONNECT_ENDPOINT, {
@@ -75,14 +80,14 @@ async function executeDataConnect(operationName, query, variables = {}) {
   }
 }
 
-// Inisialisasi Midtrans Snap Client (BEBAS HARDCODED KEY agar aman dari blokir GitHub/Vercel)
+// Inisialisasi Midtrans Snap Client dengan proteksi fallback
 const serverKey = process.env.MIDTRANS_SERVER_KEY;
 if (!serverKey) {
   console.warn("⚠ Peringatan: MIDTRANS_SERVER_KEY tidak dikonfigurasi di Environment Variables!");
 }
 
 const snap = new midtransClient.Snap({
-  isProduction: false, // Ubah ke true jika sudah production
+  isProduction: false, // Sandbox mode
   serverKey: serverKey || ""
 });
 
@@ -91,10 +96,14 @@ app.get('/healthz', (req, res) => {
   res.status(200).json({ status: 'running', message: 'Backend MySaceng Active & Integrated with Cloud SQL Data Connect' });
 });
 
-// 1. ENDPOINT: MEMBUAT TRANSAKSI / TOKEN SNAP MIDTRANS (KOMPATIBEL DENGAN FORMAT BARU & LAMA)
+// 1. ENDPOINT: MEMBUAT TRANSAKSI / TOKEN SNAP MIDTRANS
 app.post('/api/payment/token', async (req, res) => {
   try {
     let { nisn, nama, email, listTagihan, totalBayar, item, amount, index, type } = req.body;
+
+    if (!serverKey || serverKey === "") {
+        return res.status(500).json({ error: "Konfigurasi server key Midtrans di Server/Vercel belum dikonfigurasi." });
+    }
 
     // Jembatan Kompatibilitas: Konversi dinamis jika menerima request format lama
     if (!listTagihan && item && amount) {
@@ -114,11 +123,8 @@ app.post('/api/payment/token', async (req, res) => {
 
     const orderId = `INV-SPP-${Date.now()}-${nisn}`;
     const cleanEmail = email || `${nisn}@student.smkcengkareng2.sch.id`;
-
-    // Gabungkan list idTagihan menjadi string yang dipisahkan koma untuk ditaruh di custom_field1
     const tagihanIdsString = listTagihan.map(t => t.idTagihan).join(',');
 
-    // Gabungkan nama-nama item pembayaran sebagai deskripsi item Midtrans
     const itemDetails = listTagihan.map(t => ({
       id: t.idTagihan,
       price: parseInt(t.jumlahNominal),
@@ -137,7 +143,7 @@ app.post('/api/payment/token', async (req, res) => {
         phone: '08123456789'
       },
       item_details: itemDetails,
-      custom_field1: tagihanIdsString, // Mengirimkan ID Tagihan ke Midtrans agar dikembalikan saat webhook
+      custom_field1: tagihanIdsString,
       callbacks: {
         finish: "https://sppsmkcengkareng2.web.app/?payment_status=success"
       },
@@ -161,7 +167,7 @@ app.post('/api/payment/token', async (req, res) => {
   }
 });
 
-// 2. ENDPOINT: WEBHOOK NOTIFIKASI MIDTRANS (SINKRONISASI PEMBAYARAN KAS MASUK)
+// 2. ENDPOINT: WEBHOOK NOTIFIKASI MIDTRANS
 app.post('/api/payment/notification', async (req, res) => {
   try {
     const statusResponse = req.body;
@@ -170,11 +176,10 @@ app.post('/api/payment/notification', async (req, res) => {
     const fraudStatus = statusResponse.fraud_status;
     const paymentType = statusResponse.payment_type;
     const grossAmount = statusResponse.gross_amount;
-    const customField1 = statusResponse.custom_field1; // Berisi daftar idTagihan (koma terpisah)
+    const customField1 = statusResponse.custom_field1;
 
     console.log(`⚡ Menerima Webhook Midtrans: OrderID ${orderId} | Status: ${transactionStatus}`);
 
-    // Ekstrak NISN dari Order ID (Format: INV-SPP-TIMESTAMP-NISN)
     const orderParts = orderId.split('-');
     const nisn = orderParts[orderParts.length - 1];
 
@@ -185,8 +190,7 @@ app.post('/api/payment/notification', async (req, res) => {
         const cleanMethod = paymentType ? paymentType.toUpperCase().replace('_', ' ') : 'MIDTRANS';
         const itemTitle = "Pelunasan Pembayaran Online via Portal";
 
-        // A. INTEGRASI KE CLOUD SQL VIA FIREBASE DATA CONNECT
-        // 1. Catat Transaksi Log Baru di PostgreSQL (Sesuai schema.gql fisik)
+        // A. INTEGRASI KE CLOUD SQL VIA FIREBASE DATA CONNECT (PostgreSQL)
         const sqlCatatTransaksi = `
           mutation CatatTransaksiLog($idTransaksi: String!, $siswaNisn: String!, $staffUsername: String, $namaItemPembayaran: String!, $jumlahDiterima: Int!, $tanggalWaktuBayar: String!, $metodePembayaran: String!, $waktuSistemUnix: Int64!) {
             transaksi_insert(data: {
@@ -206,7 +210,7 @@ app.post('/api/payment/notification', async (req, res) => {
           await executeDataConnect('CatatTransaksiLog', sqlCatatTransaksi, {
             idTransaksi: orderId,
             siswaNisn: nisn,
-            staffUsername: null, // NULL karena transaksi online otomatis tanpa staff TU
+            staffUsername: null,
             namaItemPembayaran: itemTitle,
             jumlahDiterima: parseInt(grossAmount),
             tanggalWaktuBayar: dateStr,
@@ -218,7 +222,6 @@ app.post('/api/payment/notification', async (req, res) => {
           console.error("✗ Gagal menyisipkan log transaksi ke PostgreSQL: ", sqlErr.message);
         }
 
-        // 2. Lunasi seluruh tagihan terkait di PostgreSQL yang disimpan di customField1
         if (customField1) {
           const listIdTagihan = customField1.split(',');
           
@@ -250,11 +253,9 @@ app.post('/api/payment/notification', async (req, res) => {
               }
             }
           }
-        } else {
-          console.warn("⚠ Notifikasi sukses diterima tanpa adanya data custom_field1 (ID Tagihan).");
         }
 
-        // B. FALLBACK REALTIME SINKRONISASI FIRESTORE
+        // B. SINKRONISASI FIRESTORE DENGAN SAFETY-CHECK JIKA DB OFFLINE / NULL
         if (db) {
           try {
             const transRef = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('transactions').doc(orderId);
@@ -268,7 +269,6 @@ app.post('/api/payment/notification', async (req, res) => {
               waktuSistemUnix: Date.now()
             });
 
-            // Perbarui status tagihan siswa di Firestore NoSQL cadangan agar UI ter-render realtime
             if (customField1) {
               const listIdTagihan = customField1.split(',');
               for (const idTagihan of listIdTagihan) {
@@ -280,7 +280,6 @@ app.post('/api/payment/notification', async (req, res) => {
                   let updatedNonSpp = studentData.nonSppTagihan ? [...studentData.nonSppTagihan] : [];
                   let updatedHistory = studentData.history ? [...studentData.history] : [];
 
-                  // Cari index tagihan di NoSQL
                   const sppIdx = updatedSpp.findIndex(m => idTagihan.includes(m.m) || idTagihan.includes(m.m.replace(' ', '')));
                   if (sppIdx !== -1) {
                     updatedSpp[sppIdx].s = "Lunas";
@@ -293,7 +292,6 @@ app.post('/api/payment/notification', async (req, res) => {
                     }
                   }
 
-                  // Tambahkan ke log history siswa
                   const isHistoryExist = updatedHistory.some(h => h.id === orderId);
                   if (!isHistoryExist) {
                     updatedHistory.unshift({
