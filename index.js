@@ -9,7 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const appId = process.env.APP_ID || 'mysaceng';
 
-// Firebase Data Connect Endpoint & Config dari .env
+// Firebase Data Connect Endpoint & Config dari env
 const DATA_CONNECT_ENDPOINT = process.env.DATA_CONNECT_ENDPOINT || 'http://localhost:5001/v1/projects/sppsmkcengkareng2/locations/us-central1/connectors/demo';
 
 app.use(cors());
@@ -220,33 +220,37 @@ app.post('/api/payment/notification', async (req, res) => {
           console.warn("⚠ Notifikasi sukses diterima tanpa adanya data custom_field1 (ID Tagihan).");
         }
 
-        // B. FALLBACK REALTIME SINKRONISASI FIRESTORE (Agar dashboard frontend langsung berubah hijau tanpa reload)
+        // B. FALLBACK REALTIME SINKRONISASI FIRESTORE (Dibungkus try-catch agar error Firestore tidak membatalkan transaksi PostgreSQL utama)
         if (db) {
-          const transRef = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('transactions').doc(orderId);
-          await transRef.set({
-            idTransaksi: orderId,
-            nisn: nisn,
-            namaItemPembayaran: itemTitle,
-            jumlahDiterima: parseInt(grossAmount),
-            tanggalWaktuBayar: dateStr,
-            metodePembayaran: cleanMethod,
-            waktuSistemUnix: Date.now()
-          });
+          try {
+            const transRef = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('transactions').doc(orderId);
+            await transRef.set({
+              idTransaksi: orderId,
+              nisn: nisn,
+              namaItemPembayaran: itemTitle,
+              jumlahDiterima: parseInt(grossAmount),
+              tanggalWaktuBayar: dateStr,
+              metodePembayaran: cleanMethod,
+              waktuSistemUnix: Date.now()
+            });
 
-          // Tandai status pembayaran tagihan menjadi 'Lunas' di Firestore juga agar realtime
-          if (customField1) {
-            const listIdTagihan = customField1.split(',');
-            for (const idTagihan of listIdTagihan) {
-              const tagihanRef = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('students').doc(nisn).collection('tagihan').doc(idTagihan.trim());
-              // Perbarui status tagihan di Firestore jika ada subcollection
-              await tagihanRef.set({
-                statusPembayaran: "Lunas",
-                tanggalPelunasan: dateStr,
-                nomorReferensiTransaksi: orderId
-              }, { merge: true }).catch(() => {});
+            // Tandai status pembayaran tagihan menjadi 'Lunas' di Firestore juga agar realtime
+            if (customField1) {
+              const listIdTagihan = customField1.split(',');
+              for (const idTagihan of listIdTagihan) {
+                const tagihanRef = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('students').doc(nisn).collection('tagihan').doc(idTagihan.trim());
+                // Perbarui status tagihan di Firestore jika ada subcollection
+                await tagihanRef.set({
+                  statusPembayaran: "Lunas",
+                  tanggalPelunasan: dateStr,
+                  nomorReferensiTransaksi: orderId
+                }, { merge: true });
+              }
             }
+            console.log(`✓ [Firestore Fallback] Realtime synchronization sukses.`);
+          } catch (fsError) {
+            console.error("⚠ [Firestore Fallback] Gagal melakukan sinkronisasi realtime, namun data utama di PostgreSQL tetap aman:", fsError.message);
           }
-          console.log(`✓ [Firestore Fallback] Realtime synchronization sukses.`);
         }
       }
     }
