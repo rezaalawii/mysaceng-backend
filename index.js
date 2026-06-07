@@ -2,14 +2,20 @@ const express = require('express');
 const cors = require('cors');
 const midtransClient = require('midtrans-client');
 const admin = require('firebase-admin');
+const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 const appId = process.env.APP_ID || 'mysaceng';
 
-// Fungsi pembantu untuk menginisialisasi Firebase Admin SDK secara tangguh & aman
+// Firebase Data Connect Endpoint & Config dari .env
+const DATA_CONNECT_ENDPOINT = process.env.DATA_CONNECT_ENDPOINT || 'http://localhost:5001/v1/projects/sppsmkcengkareng2/locations/us-central1/connectors/demo';
+
+app.use(cors());
+app.use(express.json());
+
+// Inisialisasi Firebase Admin untuk fallback realtime sync
 function initFirebaseAdmin() {
   if (admin.apps.length > 0) {
     return admin.apps[0].firestore();
@@ -18,231 +24,230 @@ function initFirebaseAdmin() {
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     try {
       let rawServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
-      
-      // Mengatasi string escape newline (\\n) yang sering rusak di environment variable Vercel
       if (rawServiceAccount.includes('\\n')) {
         rawServiceAccount = rawServiceAccount.replace(/\\n/g, '\n');
       }
-      
       const serviceAccount = JSON.parse(rawServiceAccount);
-      
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount)
       });
-      console.log("✓ Firebase Admin SDK berhasil diinisialisasi secara sempurna.");
+      console.log("✓ Firebase Admin SDK berhasil diinisialisasi.");
       return admin.firestore();
     } catch (err) {
-      console.error("✗ Gagal menginisialisasi Firebase Admin SDK karena error parsing JSON:", err.message);
+      console.error("✗ Gagal menginisialisasi Firebase Admin SDK:", err.message);
     }
   } else {
-    console.warn("⚠ FIREBASE_SERVICE_ACCOUNT tidak ditemukan di Environment Variables.");
+    console.warn("⚠ FIREBASE_SERVICE_ACCOUNT tidak ditemukan di env. Berjalan tanpa Firestore fallback.");
   }
   return null;
 }
 
-// Inisialisasi awal saat server dinyalakan
-initFirebaseAdmin();
+const db = initFirebaseAdmin();
 
-// Mengaktifkan CORS agar diizinkan diakses oleh domain Firebase / Production Frontend Anda
-app.use(cors({
-  origin: ['https://sppsmkcengkareng2.web.app', 'http://localhost:5000', 'http://127.0.0.1:5000'],
-  methods: ['GET', 'POST'],
-  credentials: true
-}));
-
-app.use(express.json());
-
-// Endpoint Kesehatan Server (Health Check)
-app.get('/healthz', (req, res) => {
-  res.status(200).send('OK');
-});
-
-// Endpoint untuk Membuat Token Transaksi Midtrans
-app.post('/api/payment/token', async (req, res) => {
+// Helper untuk eksekusi query/mutation ke Firebase Data Connect (Cloud SQL PostgreSQL)
+async function executeDataConnect(operationName, query, variables = {}) {
   try {
-    const { nisn, nama, item, amount, index, type } = req.body;
-
-    if (!nisn || !amount) {
-      return res.status(400).json({ error: "Parameter nisn dan amount wajib diisi." });
-    }
-
-    const serverKey = process.env.MIDTRANS_SERVER_KEY;
-    if (!serverKey) {
-      console.error("Missing MIDTRANS_SERVER_KEY environment variable");
-      return res.status(500).json({ error: "Server configuration error: Missing API Key." });
-    }
-
-    // Inisialisasi Midtrans Snap client
-    const snap = new midtransClient.Snap({
-      isProduction: false, // Set ke true jika sudah production
-      serverKey: serverKey
+    const response = await axios.post(DATA_CONNECT_ENDPOINT, {
+      query: query,
+      operationName: operationName,
+      variables: variables
+    }, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
     });
 
-    // Generate Order ID yang unik namun informatif
-    // Format: INV-SPP-NISN-INDEX-TIMESTAMP (misal: INV-SPP-102649281-0-1716550200)
-    const orderId = `INV-${type.toUpperCase()}-${nisn}-${index}-${Date.now()}`;
+    if (response.data.errors) {
+      console.error(`✗ Gagal eksekusi Data Connect [${operationName}]:`, JSON.stringify(response.data.errors, null, 2));
+      throw new Error(response.data.errors[0].message);
+    }
+    return response.data.data;
+  } catch (error) {
+    console.error(`✗ Network Error pada Data Connect [${operationName}]:`, error.message);
+    throw error;
+  }
+}
+
+// Inisialisasi Midtrans Snap Client
+const snap = new midtransClient.Snap({
+  isProduction: false, // Ubah ke true jika sudah production
+  serverKey: process.env.MIDTRANS_SERVER_KEY || 'SB-Mid-server-xX2v9W0y_V8R3RjGqH_Vv7s-',
+  clientKey: process.env.MIDTRANS_CLIENT_KEY || 'Mid-client-U0pExnksmEJZEOTR'
+});
+
+// Endpoint dasar untuk cek konektivitas backend
+app.get('/', (req, res) => {
+  res.status(200).json({ status: 'running', message: 'Backend MySaceng Active & Integrated with Cloud SQL Data Connect' });
+});
+
+// 1. ENDPOINT: MEMBUAT TRANSAKSI / TOKEN SNAP MIDTRANS
+app.post('/api/payment/token', async (req, res) => {
+  try {
+    const { nisn, nama, email, listTagihan, totalBayar } = req.body;
+
+    if (!nisn || !listTagihan || listTagihan.length === 0 || !totalBayar) {
+      return res.status(400).json({ error: 'Data pembayaran tidak lengkap!' });
+    }
+
+    const orderId = `INV-SPP-${Date.now()}-${nisn}`;
+    const cleanEmail = email || `${nisn}@student.smkcengkareng2.sch.id`;
+
+    // Gabungkan list idTagihan menjadi string yang dipisahkan koma untuk ditaruh di custom_field1
+    const tagihanIdsString = listTagihan.map(t => t.idTagihan).join(',');
+
+    // Gabungkan nama-nama item pembayaran sebagai deskripsi item Midtrans
+    const itemDetails = listTagihan.map(t => ({
+      id: t.idTagihan,
+      price: parseInt(t.jumlahNominal),
+      quantity: 1,
+      name: t.namaTagihan.substring(0, 50)
+    }));
 
     const parameter = {
       transaction_details: {
         order_id: orderId,
-        gross_amount: parseInt(amount)
+        gross_amount: parseInt(totalBayar)
       },
       customer_details: {
         first_name: nama,
-        email: `${nisn}@student.smkcengkareng2.sch.id`
+        email: cleanEmail,
+        phone: '08123456789'
       },
-      item_details: [{
-        id: `ITEM-${index}`,
-        price: parseInt(amount),
-        quantity: 1,
-        name: item
-      }],
-      // SOLUSI REDIRECT: Mengatur callback URL secara manual dengan parameter sukses agar dideteksi frontend
-      callbacks: {
-        finish: "https://sppsmkcengkareng2.web.app/?payment_status=success"
+      item_details: itemDetails,
+      custom_field1: tagihanIdsString, // Mengirimkan ID Tagihan ke Midtrans agar dikembalikan saat webhook
+      expiry: {
+        start_time: getFormattedCurrentDateTimeMidtrans(),
+        unit: 'minutes',
+        duration: 120
       }
     };
 
     const transaction = await snap.createTransaction(parameter);
-    res.status(200).json({ token: transaction.token, redirect_url: transaction.redirect_url });
-
+    
+    res.status(200).json({
+      token: transaction.token,
+      redirect_url: transaction.redirect_url,
+      orderId: orderId
+    });
   } catch (error) {
-    console.error("Gagal membuat token Midtrans:", error);
+    console.error("✗ Gagal membuat Snap Token Midtrans:", error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Endpoint Webhook Baru untuk Menangkap Notifikasi HTTP Otomatis dari Midtrans
+// 2. ENDPOINT: WEBHOOK NOTIFIKASI MIDTRANS (SINKRONISASI PEMBAYARAN KAS MASUK)
 app.post('/api/payment/notification', async (req, res) => {
   try {
-    const serverKey = process.env.MIDTRANS_SERVER_KEY;
-    if (!serverKey) {
-      return res.status(500).json({ error: "Server configuration error: Missing API Key." });
-    }
+    const statusResponse = req.body;
+    const orderId = statusResponse.order_id;
+    const transactionStatus = statusResponse.transaction_status;
+    const fraudStatus = statusResponse.fraud_status;
+    const paymentType = statusResponse.payment_type;
+    const grossAmount = statusResponse.gross_amount;
+    const customField1 = statusResponse.custom_field1; // Berisi daftar idTagihan (koma terpisah)
 
-    const snap = new midtransClient.Snap({
-      isProduction: false,
-      serverKey: serverKey
-    });
+    console.log(`⚡ Menerima Webhook Midtrans: OrderID ${orderId} | Status: ${transactionStatus}`);
 
-    // Validasi notifikasi resmi dari Midtrans
-    const statusResponse = await snap.transaction.notification(req.body);
-    
-    const {
-      order_id: orderId,
-      transaction_status: transactionStatus,
-      payment_type: paymentType,
-      fraud_status: fraudStatus,
-      gross_amount: grossAmount
-    } = statusResponse;
+    // Ekstrak NISN dari Order ID (Format: INV-SPP-TIMESTAMP-NISN)
+    const orderParts = orderId.split('-');
+    const nisn = orderParts[orderParts.length - 1];
 
-    console.log(`[Midtrans Webhook] Menerima status order: ${orderId}. Status: ${transactionStatus}`);
+    if (transactionStatus === 'settlement' || transactionStatus === 'capture') {
+      if (fraudStatus === 'accept' || transactionStatus === 'settlement') {
+        
+        const dateStr = getFormattedCurrentDateTime();
+        const cleanMethod = paymentType ? paymentType.toUpperCase().replace('_', ' ') : 'MIDTRANS';
+        const itemTitle = "Pelunasan Pembayaran Online via Portal";
 
-    // Cek apakah status pembayaran sukses
-    const isPaymentSuccess = 
-      transactionStatus === 'capture' && fraudStatus === 'accept' ||
-      transactionStatus === 'settlement';
-
-    if (isPaymentSuccess) {
-      // Parsing data dari Order ID (INV-TYPE-NISN-INDEX-TIMESTAMP)
-      // Contoh: ["INV", "SPP", "102649281", "0", "1779644302638"]
-      const parts = orderId.split('-');
-      
-      // Dapatkan atau inisialisasi instance Firestore secara realtime (tangguh untuk Serverless)
-      const db = initFirebaseAdmin();
-
-      if (parts.length >= 4 && db) {
-        const type = parts[1].toLowerCase(); // "spp" atau "non" / "other"
-        const nisn = parts[2];
-        const itemIndex = parseInt(parts[3]);
-
-        // Skenario 1: Cari dokumen siswa dengan ID dokumen = NISN langsung
-        let studentRef = db.doc(`artifacts/${appId}/public/data/students/${nisn}`);
-        let docSnap = await studentRef.get();
-
-        // Skenario 2 (Tangguh): Jika ID dokumen bukan NISN langsung, lakukan query pencarian field 'nisn'
-        // Mendukung pencocokan format tipe data String maupun Number di Firestore
-        if (!docSnap.exists) {
-          console.log(`[Fallback Search 1] Dokumen ID ${nisn} tidak ditemukan. Mencari via field 'nisn' (String)...`);
-          const studentsColl = db.collection(`artifacts/${appId}/public/data/students`);
-          
-          // Uji pencarian NISN sebagai String
-          let querySnapshot = await studentsColl.where('nisn', '==', nisn).get();
-          
-          // Uji pencarian NISN sebagai Number jika pencarian String di atas nihil
-          if (querySnapshot.empty && !isNaN(nisn)) {
-            console.log(`[Fallback Search 2] Mencari via field 'nisn' (Number) == ${parseInt(nisn)}...`);
-            querySnapshot = await studentsColl.where('nisn', '==', parseInt(nisn)).get();
+        // A. INTEGRASI KE CLOUD SQL VIA FIREBASE DATA CONNECT
+        // 1. Catat Transaksi Log Baru di PostgreSQL
+        const sqlCatatTransaksi = `
+          mutation CatatTransaksiLog($idTransaksi: String!, $siswaNisn: String!, $staffUsername: String, $namaItemPembayaran: String!, $jumlahDiterima: Int!, $tanggalWaktuBayar: String!, $metodePembayaran: String!, $waktuSistemUnix: Int64!) {
+            transaksi_insert(data: {
+              idTransaksi: $idTransaksi,
+              siswa: { nisn: $siswaNisn },
+              pencatatStaff: { usernameStaff: $staffUsername },
+              namaItemPembayaran: $namaItemPembayaran,
+              jumlahDiterima: $jumlahDiterima,
+              tanggalWaktuBayar: $tanggalWaktuBayar,
+              metodePembayaran: $metodePembayaran,
+              waktuSistemUnix: $waktuSistemUnix
+            })
           }
+        `;
+
+        await executeDataConnect('CatatTransaksiLog', sqlCatatTransaksi, {
+          idTransaksi: orderId,
+          siswaNisn: nisn,
+          staffUsername: null, // NULL karena transaksi online otomatis tanpa staff TU
+          namaItemPembayaran: itemTitle,
+          jumlahDiterima: parseInt(grossAmount),
+          tanggalWaktuBayar: dateStr,
+          metodePembayaran: cleanMethod,
+          waktuSistemUnix: Date.now()
+        });
+        console.log(`✓ [PostgreSQL Cloud SQL] Log transaksi ${orderId} sukses dicatat.`);
+
+        // 2. Lunasi seluruh tagihan terkait di PostgreSQL yang disimpan di customField1
+        if (customField1) {
+          const listIdTagihan = customField1.split(',');
           
-          if (!querySnapshot.empty) {
-            studentRef = querySnapshot.docs[0].ref;
-            docSnap = querySnapshot.docs[0];
-            console.log(`[Fallback Found] Menemukan dokumen siswa dengan ID dokumen: ${docSnap.id}`);
-          }
-        }
-
-        if (docSnap.exists) {
-          const studentData = docSnap.data();
-          const dateStr = getFormattedCurrentDateTime();
-          const cleanMethod = (paymentType || 'MIDTRANS').toUpperCase();
-
-          let updatedSpp = studentData.sppMonths ? [...studentData.sppMonths] : [];
-          let updatedNonSpp = studentData.nonSppTagihan ? [...studentData.nonSppTagihan] : [];
-          let updatedHistory = studentData.history ? [...studentData.history] : [];
-          let itemTitle = "";
-
-          if (type === 'spp') {
-            if (updatedSpp[itemIndex]) {
-              updatedSpp[itemIndex].s = "Lunas";
-              updatedSpp[itemIndex].date = dateStr;
-              updatedSpp[itemIndex].ref = `${orderId} - ${cleanMethod}`;
-              itemTitle = `SPP ${updatedSpp[itemIndex].m}`;
+          const sqlLunasiTagihan = `
+            mutation LunasiTagihanSiswa($idTagihan: UUID!, $statusPembayaran: String!, $tanggalPelunasan: String, $nomorReferensiTransaksi: String) {
+              tagihan_update(
+                key: { idTagihan: $idTagihan },
+                data: {
+                  statusPembayaran: $statusPembayaran,
+                  tanggalPelunasan: $tanggalPelunasan,
+                  nomorReferensiTransaksi: $nomorReferensiTransaksi
+                }
+              )
             }
-          } else {
-            if (updatedNonSpp[itemIndex]) {
-              updatedNonSpp[itemIndex].status = "Lunas";
-              itemTitle = updatedNonSpp[itemIndex].name;
+          `;
+
+          for (const idTagihan of listIdTagihan) {
+            if (idTagihan.trim()) {
+              await executeDataConnect('LunasiTagihanSiswa', sqlLunasiTagihan, {
+                idTagihan: idTagihan.trim(),
+                statusPembayaran: "Lunas",
+                tanggalPelunasan: dateStr,
+                nomorReferensiTransaksi: orderId
+              });
+              console.log(`✓ [PostgreSQL Cloud SQL] Tagihan ${idTagihan} berhasil dilunasi.`);
             }
           }
-
-          // Tambah ke riwayat transaksi siswa jika belum terdaftar
-          const isHistoryExist = updatedHistory.some(h => h.id === orderId);
-          if (!isHistoryExist && itemTitle !== "") {
-            updatedHistory.unshift({
-              id: orderId,
-              title: itemTitle,
-              amount: parseInt(grossAmount).toLocaleString('id-ID'),
-              date: dateStr,
-              status: `LUNAS - ${cleanMethod}`
-            });
-          }
-
-          // Simpan perubahan ke Firestore secara aman
-          await studentRef.update({
-            sppMonths: updatedSpp,
-            nonSppTagihan: updatedNonSpp,
-            history: updatedHistory
-          });
-
-          // Daftarkan ke log transaksi global di Firestore agar Panel Admin TU terupdate instan
-          const logRef = db.doc(`artifacts/${appId}/public/data/transaction_logs/${orderId}`);
-          await logRef.set({
-            id: orderId,
-            nama: studentData.nama,
-            title: itemTitle,
-            amount: parseInt(grossAmount),
-            date: dateStr,
-            method: cleanMethod,
-            timestamp: Date.now()
-          });
-
-          console.log(`✓ Database Firestore berhasil terupdate untuk NISN: ${nisn} (${itemTitle})`);
         } else {
-          console.warn(`⚠ Siswa dengan NISN ${nisn} tidak ditemukan di database.`);
+          console.warn("⚠ Notifikasi sukses diterima tanpa adanya data custom_field1 (ID Tagihan).");
         }
-      } else {
-        console.error("✗ Gagal memproses data karena inisialisasi database Firestore tidak aktif.");
+
+        // B. FALLBACK REALTIME SINKRONISASI FIRESTORE (Agar dashboard frontend langsung berubah hijau tanpa reload)
+        if (db) {
+          const transRef = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('transactions').doc(orderId);
+          await transRef.set({
+            idTransaksi: orderId,
+            nisn: nisn,
+            namaItemPembayaran: itemTitle,
+            jumlahDiterima: parseInt(grossAmount),
+            tanggalWaktuBayar: dateStr,
+            metodePembayaran: cleanMethod,
+            waktuSistemUnix: Date.now()
+          });
+
+          // Tandai status pembayaran tagihan menjadi 'Lunas' di Firestore juga agar realtime
+          if (customField1) {
+            const listIdTagihan = customField1.split(',');
+            for (const idTagihan of listIdTagihan) {
+              const tagihanRef = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('students').doc(nisn).collection('tagihan').doc(idTagihan.trim());
+              // Perbarui status tagihan di Firestore jika ada subcollection
+              await tagihanRef.set({
+                statusPembayaran: "Lunas",
+                tanggalPelunasan: dateStr,
+                nomorReferensiTransaksi: orderId
+              }, { merge: true }).catch(() => {});
+            }
+          }
+          console.log(`✓ [Firestore Fallback] Realtime synchronization sukses.`);
+        }
       }
     }
 
@@ -253,18 +258,27 @@ app.post('/api/payment/notification', async (req, res) => {
   }
 });
 
-// Fungsi pembantu pembacaan waktu lokal server
+// HELPER FORMAT WAKTU
 function getFormattedCurrentDateTime() {
   const now = new Date();
   const date = String(now.getDate()).padStart(2, '0');
   const months = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
-  const month = months[now.getMonth()];
-  const year = now.getFullYear();
   const hrs = String(now.getHours()).padStart(2, '0');
   const mins = String(now.getMinutes()).padStart(2, '0');
-  return `${date} ${month} ${year}, ${hrs}:${mins}`;
+  return `${date} ${months[now.getMonth()]} ${now.getFullYear()}, ${hrs}:${mins}`;
+}
+
+function getFormattedCurrentDateTimeMidtrans() {
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  const hh = String(now.getHours()).padStart(2, '0');
+  const min = String(now.getMinutes()).padStart(2, '0');
+  const ss = String(now.getSeconds()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd} ${hh}:${min}:${ss} +0700`;
 }
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`✓ Server MySaceng Backend berjalan di port ${PORT}`);
 });
