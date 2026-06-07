@@ -253,10 +253,10 @@ app.post('/api/payment/notification', async (req, res) => {
         // B. SINKRONISASI FIRESTORE DENGAN SAFETY-CHECK JIKA DB OFFLINE / NULL
         if (db) {
           try {
-            // DIUBAH: Menggunakan 'transaction_logs' agar serasi dengan pembacaan koleksi di index.html admin panel!
+            // SINKRON: Menggunakan 'transaction_logs' agar serasi dengan pembacaan koleksi di index.html admin panel!
             const transRef = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('transaction_logs').doc(orderId);
             await transRef.set({
-              id: orderId, // Diselaraskan menggunakan 'id'
+              id: orderId, 
               nama: statusResponse.customer_details ? `${statusResponse.customer_details.first_name}` : "Siswa Online",
               title: itemTitle,
               amount: parseInt(grossAmount),
