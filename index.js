@@ -102,7 +102,7 @@ app.post('/api/payment/token', async (req, res) => {
     let { nisn, nama, email, listTagihan, totalBayar, item, amount, index, type } = req.body;
 
     if (!serverKey || serverKey === "") {
-        return res.status(500).json({ error: "Konfigurasi server key Midtrans di Server/Vercel belum dikonfigurasi." });
+        return res.status(500).json({ error: "MIDTRANS_SERVER_KEY tidak ditemukan di environment Vercel. Harap tambahkan terlebih dahulu dan lakukan Redeploy." });
     }
 
     // Jembatan Kompatibilitas: Konversi dinamis jika menerima request format lama
@@ -146,12 +146,8 @@ app.post('/api/payment/token', async (req, res) => {
       custom_field1: tagihanIdsString,
       callbacks: {
         finish: "https://sppsmkcengkareng2.web.app/?payment_status=success"
-      },
-      expiry: {
-        start_time: getFormattedCurrentDateTimeMidtrans(),
-        unit: 'minutes',
-        duration: 120
       }
+      // Membuang parameter "expiry" custom untuk mencegah penolakan jam server Vercel vs Midtrans
     };
 
     const transaction = await snap.createTransaction(parameter);
@@ -163,7 +159,7 @@ app.post('/api/payment/token', async (req, res) => {
     });
   } catch (error) {
     console.error("✗ Gagal membuat Snap Token Midtrans:", error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: "Gagal memproses token Midtrans: " + error.message });
   }
 });
 
