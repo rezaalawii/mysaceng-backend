@@ -253,11 +253,21 @@ app.post('/api/payment/notification', async (req, res) => {
         // B. SINKRONISASI FIRESTORE DENGAN SAFETY-CHECK JIKA DB OFFLINE / NULL
         if (db) {
           try {
-            // SINKRON: Menggunakan 'transaction_logs' agar serasi dengan pembacaan koleksi di index.html admin panel!
+            // FIX SAFETY: Ambil nama asli siswa dari Firestore NoSQL jika data dari Midtrans kosong
+            let studentName = "Siswa Online";
+            try {
+              const studentDoc = await db.collection('artifacts').doc(appId).collection('public').doc('data').collection('students').doc(nisn).get();
+              if (studentDoc.exists) {
+                studentName = studentDoc.data().nama;
+              }
+            } catch (err) {
+              console.warn("Gagal mengambil nama siswa dari Firestore:", err.message);
+            }
+
             const transRef = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('transaction_logs').doc(orderId);
             await transRef.set({
               id: orderId, 
-              nama: statusResponse.customer_details ? `${statusResponse.customer_details.first_name}` : "Siswa Online",
+              nama: studentName,
               title: itemTitle,
               amount: parseInt(grossAmount),
               date: dateStr,
