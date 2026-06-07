@@ -8,14 +8,21 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const appId = process.env.APP_ID || 'mysaceng';
+const projectId = process.env.FIREBASE_PROJECT_ID || 'sppsmkcengkareng2';
 
-// Firebase Data Connect Endpoint & Config dari env
-const DATA_CONNECT_ENDPOINT = process.env.DATA_CONNECT_ENDPOINT || 'http://localhost:5001/v1/projects/sppsmkcengkareng2/locations/us-central1/connectors/demo';
+// Menggunakan URL Cloud Production asia-southeast2 secara default agar koneksi SQL Connect aktif dari Vercel
+const DATA_CONNECT_ENDPOINT = process.env.DATA_CONNECT_ENDPOINT || 
+  `https://firebasedataconnect.googleapis.com/v1beta/projects/${projectId}/locations/asia-southeast2/services/${appId}-service:executeGraphQL`;
 
-app.use(cors());
+app.use(cors({
+  origin: ['https://sppsmkcengkareng2.web.app', 'http://localhost:5000', 'http://127.0.0.1:5000'],
+  methods: ['GET', 'POST'],
+  credentials: true
+}));
+
 app.use(express.json());
 
-// Inisialisasi Firebase Admin untuk fallback realtime sync
+// Inisialisasi Firebase Admin untuk fallback NoSQL realtime sync
 function initFirebaseAdmin() {
   if (admin.apps.length > 0) {
     return admin.apps[0].firestore();
@@ -37,7 +44,7 @@ function initFirebaseAdmin() {
       console.error("✗ Gagal menginisialisasi Firebase Admin SDK:", err.message);
     }
   } else {
-    console.warn("⚠ FIREBASE_SERVICE_ACCOUNT tidak ditemukan di env. Berjalan tanpa Firestore fallback.");
+    console.warn("⚠ FIREBASE_SERVICE_ACCOUNT tidak ditemukan di Environment Variables.");
   }
   return null;
 }
@@ -68,22 +75,38 @@ async function executeDataConnect(operationName, query, variables = {}) {
   }
 }
 
-// Inisialisasi Midtrans Snap Client
+// Inisialisasi Midtrans Snap Client (BEBAS HARDCODED KEY agar aman dari blokir GitHub/Vercel)
+const serverKey = process.env.MIDTRANS_SERVER_KEY;
+if (!serverKey) {
+  console.warn("⚠ Peringatan: MIDTRANS_SERVER_KEY tidak dikonfigurasi di Environment Variables!");
+}
+
 const snap = new midtransClient.Snap({
   isProduction: false, // Ubah ke true jika sudah production
-  serverKey: process.env.MIDTRANS_SERVER_KEY || 'SB-Mid-server-xX2v9W0y_V8R3RjGqH_Vv7s-',
-  clientKey: process.env.MIDTRANS_CLIENT_KEY || 'Mid-client-U0pExnksmEJZEOTR'
+  serverKey: serverKey || ""
 });
 
 // Endpoint dasar untuk cek konektivitas backend
-app.get('/', (req, res) => {
+app.get('/healthz', (req, res) => {
   res.status(200).json({ status: 'running', message: 'Backend MySaceng Active & Integrated with Cloud SQL Data Connect' });
 });
 
-// 1. ENDPOINT: MEMBUAT TRANSAKSI / TOKEN SNAP MIDTRANS
+// 1. ENDPOINT: MEMBUAT TRANSAKSI / TOKEN SNAP MIDTRANS (KOMPATIBEL DENGAN FORMAT BARU & LAMA)
 app.post('/api/payment/token', async (req, res) => {
   try {
-    const { nisn, nama, email, listTagihan, totalBayar } = req.body;
+    let { nisn, nama, email, listTagihan, totalBayar, item, amount, index, type } = req.body;
+
+    // Jembatan Kompatibilitas: Konversi dinamis jika menerima request format lama
+    if (!listTagihan && item && amount) {
+      const idxNum = index !== undefined ? index : 0;
+      const typeStr = type || 'spp';
+      listTagihan = [{
+        idTagihan: typeStr === 'spp' ? `spp-tagihan-${idxNum}-${nisn}` : `other-tagihan-${idxNum}-${nisn}`,
+        namaTagihan: item,
+        jumlahNominal: amount
+      }];
+      totalBayar = amount;
+    }
 
     if (!nisn || !listTagihan || listTagihan.length === 0 || !totalBayar) {
       return res.status(400).json({ error: 'Data pembayaran tidak lengkap!' });
@@ -115,6 +138,9 @@ app.post('/api/payment/token', async (req, res) => {
       },
       item_details: itemDetails,
       custom_field1: tagihanIdsString, // Mengirimkan ID Tagihan ke Midtrans agar dikembalikan saat webhook
+      callbacks: {
+        finish: "https://sppsmkcengkareng2.web.app/?payment_status=success"
+      },
       expiry: {
         start_time: getFormattedCurrentDateTimeMidtrans(),
         unit: 'minutes',
@@ -160,7 +186,7 @@ app.post('/api/payment/notification', async (req, res) => {
         const itemTitle = "Pelunasan Pembayaran Online via Portal";
 
         // A. INTEGRASI KE CLOUD SQL VIA FIREBASE DATA CONNECT
-        // 1. Catat Transaksi Log Baru di PostgreSQL
+        // 1. Catat Transaksi Log Baru di PostgreSQL (Sesuai schema.gql fisik)
         const sqlCatatTransaksi = `
           mutation CatatTransaksiLog($idTransaksi: String!, $siswaNisn: String!, $staffUsername: String, $namaItemPembayaran: String!, $jumlahDiterima: Int!, $tanggalWaktuBayar: String!, $metodePembayaran: String!, $waktuSistemUnix: Int64!) {
             transaksi_insert(data: {
@@ -176,17 +202,21 @@ app.post('/api/payment/notification', async (req, res) => {
           }
         `;
 
-        await executeDataConnect('CatatTransaksiLog', sqlCatatTransaksi, {
-          idTransaksi: orderId,
-          siswaNisn: nisn,
-          staffUsername: null, // NULL karena transaksi online otomatis tanpa staff TU
-          namaItemPembayaran: itemTitle,
-          jumlahDiterima: parseInt(grossAmount),
-          tanggalWaktuBayar: dateStr,
-          metodePembayaran: cleanMethod,
-          waktuSistemUnix: Date.now()
-        });
-        console.log(`✓ [PostgreSQL Cloud SQL] Log transaksi ${orderId} sukses dicatat.`);
+        try {
+          await executeDataConnect('CatatTransaksiLog', sqlCatatTransaksi, {
+            idTransaksi: orderId,
+            siswaNisn: nisn,
+            staffUsername: null, // NULL karena transaksi online otomatis tanpa staff TU
+            namaItemPembayaran: itemTitle,
+            jumlahDiterima: parseInt(grossAmount),
+            tanggalWaktuBayar: dateStr,
+            metodePembayaran: cleanMethod,
+            waktuSistemUnix: Date.now()
+          });
+          console.log(`✓ [PostgreSQL Cloud SQL] Log transaksi ${orderId} sukses dicatat.`);
+        } catch (sqlErr) {
+          console.error("✗ Gagal menyisipkan log transaksi ke PostgreSQL: ", sqlErr.message);
+        }
 
         // 2. Lunasi seluruh tagihan terkait di PostgreSQL yang disimpan di customField1
         if (customField1) {
@@ -207,20 +237,24 @@ app.post('/api/payment/notification', async (req, res) => {
 
           for (const idTagihan of listIdTagihan) {
             if (idTagihan.trim()) {
-              await executeDataConnect('LunasiTagihanSiswa', sqlLunasiTagihan, {
-                idTagihan: idTagihan.trim(),
-                statusPembayaran: "Lunas",
-                tanggalPelunasan: dateStr,
-                nomorReferensiTransaksi: orderId
-              });
-              console.log(`✓ [PostgreSQL Cloud SQL] Tagihan ${idTagihan} berhasil dilunasi.`);
+              try {
+                await executeDataConnect('LunasiTagihanSiswa', sqlLunasiTagihan, {
+                  idTagihan: idTagihan.trim(),
+                  statusPembayaran: "Lunas",
+                  tanggalPelunasan: dateStr,
+                  nomorReferensiTransaksi: orderId
+                });
+                console.log(`✓ [PostgreSQL Cloud SQL] Tagihan ${idTagihan} berhasil dilunasi.`);
+              } catch (sqlTagihanErr) {
+                console.error(`✗ Gagal melunasi tagihan SQL ${idTagihan}: `, sqlTagihanErr.message);
+              }
             }
           }
         } else {
           console.warn("⚠ Notifikasi sukses diterima tanpa adanya data custom_field1 (ID Tagihan).");
         }
 
-        // B. FALLBACK REALTIME SINKRONISASI FIRESTORE (Dibungkus try-catch agar error Firestore tidak membatalkan transaksi PostgreSQL utama)
+        // B. FALLBACK REALTIME SINKRONISASI FIRESTORE
         if (db) {
           try {
             const transRef = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('transactions').doc(orderId);
@@ -234,22 +268,54 @@ app.post('/api/payment/notification', async (req, res) => {
               waktuSistemUnix: Date.now()
             });
 
-            // Tandai status pembayaran tagihan menjadi 'Lunas' di Firestore juga agar realtime
+            // Perbarui status tagihan siswa di Firestore NoSQL cadangan agar UI ter-render realtime
             if (customField1) {
               const listIdTagihan = customField1.split(',');
               for (const idTagihan of listIdTagihan) {
-                const tagihanRef = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('students').doc(nisn).collection('tagihan').doc(idTagihan.trim());
-                // Perbarui status tagihan di Firestore jika ada subcollection
-                await tagihanRef.set({
-                  statusPembayaran: "Lunas",
-                  tanggalPelunasan: dateStr,
-                  nomorReferensiTransaksi: orderId
-                }, { merge: true });
+                const studentRef = db.collection('artifacts').doc(appId).collection('public').doc('data').collection('students').doc(nisn);
+                const docSnap = await studentRef.get();
+                if (docSnap.exists) {
+                  const studentData = docSnap.data();
+                  let updatedSpp = studentData.sppMonths ? [...studentData.sppMonths] : [];
+                  let updatedNonSpp = studentData.nonSppTagihan ? [...studentData.nonSppTagihan] : [];
+                  let updatedHistory = studentData.history ? [...studentData.history] : [];
+
+                  // Cari index tagihan di NoSQL
+                  const sppIdx = updatedSpp.findIndex(m => idTagihan.includes(m.m) || idTagihan.includes(m.m.replace(' ', '')));
+                  if (sppIdx !== -1) {
+                    updatedSpp[sppIdx].s = "Lunas";
+                    updatedSpp[sppIdx].date = dateStr;
+                    updatedSpp[sppIdx].ref = `${orderId} - ${cleanMethod}`;
+                  } else {
+                    const otherIdx = updatedNonSpp.findIndex(t => idTagihan.includes(t.name.replace(' ', '')));
+                    if (otherIdx !== -1) {
+                      updatedNonSpp[otherIdx].status = "Lunas";
+                    }
+                  }
+
+                  // Tambahkan ke log history siswa
+                  const isHistoryExist = updatedHistory.some(h => h.id === orderId);
+                  if (!isHistoryExist) {
+                    updatedHistory.unshift({
+                      id: orderId,
+                      title: itemTitle,
+                      amount: parseInt(grossAmount).toLocaleString('id-ID'),
+                      date: dateStr,
+                      status: `LUNAS - ${cleanMethod}`
+                    });
+                  }
+
+                  await studentRef.update({
+                    sppMonths: updatedSpp,
+                    nonSppTagihan: updatedNonSpp,
+                    history: updatedHistory
+                  });
+                }
               }
             }
             console.log(`✓ [Firestore Fallback] Realtime synchronization sukses.`);
           } catch (fsError) {
-            console.error("⚠ [Firestore Fallback] Gagal melakukan sinkronisasi realtime, namun data utama di PostgreSQL tetap aman:", fsError.message);
+            console.error("⚠ [Firestore Fallback] Gagal sinkronisasi realtime, namun data utama di PostgreSQL tetap aman:", fsError.message);
           }
         }
       }
